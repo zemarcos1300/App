@@ -1,0 +1,823 @@
+package com.veil.launcher
+
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.SharedPreferences
+import android.content.pm.PackageManager
+import android.graphics.drawable.Drawable
+import android.net.Uri
+import android.os.Bundle
+import android.os.SystemClock
+import android.provider.Settings
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.core.graphics.drawable.toBitmap
+import org.json.JSONArray
+import org.json.JSONObject
+import java.security.KeyStore
+import java.security.MessageDigest
+import java.security.SecureRandom
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import javax.crypto.SecretKeyFactory
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.PBEKeySpec
+import kotlin.math.atan2
+import kotlin.math.hypot
+
+private val Night = Color(0xFF080B12)
+private val Panel = Color(0xFF151C29)
+private val Panel2 = Color(0xFF202B3D)
+private val Silver = Color(0xFFB9C8E2)
+private val White = Color(0xFFF3F6FC)
+private val Muted = Color(0xFF8996AB)
+private val Danger = Color(0xFFFF9292)
+
+data class VeilAppInfo(val label: String, val packageName: String, val icon: Drawable)
+
+class MainActivity : ComponentActivity() {
+    private var resumeTick by mutableIntStateOf(0)
+    private var stoppedAt by mutableLongStateOf(0L)
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        window.statusBarColor = android.graphics.Color.rgb(8, 11, 18)
+        window.navigationBarColor = android.graphics.Color.rgb(8, 11, 18)
+        setContent { VeilTheme { VeilRoot(this, resumeTick, stoppedAt) } }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        resumeTick++
+    }
+
+    override fun onStop() {
+        super.onStop()
+        stoppedAt = SystemClock.elapsedRealtime()
+    }
+}
+
+@Composable
+internal fun VeilTheme(content: @Composable () -> Unit) {
+    MaterialTheme(
+        colorScheme = darkColorScheme(
+            primary = Silver, onPrimary = Night, background = Night,
+            surface = Panel, onSurface = White, secondary = Muted,
+            error = Danger
+        ),
+        content = content
+    )
+}
+
+private enum class Page { HOME, SETTINGS, SETUP, AUTH, CHANGE_AUTH }
+private enum class AuthPurpose { OPEN_APP, OPEN_SETTINGS }
+
+private fun isGuardEnabled(context: Context): Boolean {
+    val enabled = Settings.Secure.getString(
+        context.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+    ) ?: return false
+    val component = ComponentName(context, VeilGuardService::class.java)
+    return enabled.split(':').any { ComponentName.unflattenFromString(it) == component }
+}
+
+@Composable
+private fun VeilRoot(context: Context, refreshTick: Int, stoppedAt: Long) {
+    val store = remember { SecureStore.get(context) }
+    val apps = remember(refreshTick) { loadLaunchableApps(context) }
+    var page by remember { mutableStateOf(if (store.configured()) Page.HOME else Page.SETUP) }
+    var protected by remember { mutableStateOf(store.protectedApps()) }
+    var selected by remember { mutableStateOf<VeilAppInfo?>(null) }
+    var purpose by remember { mutableStateOf(AuthPurpose.OPEN_APP) }
+    var authError by remember { mutableStateOf("") }
+    var lockOnUnlock by remember { mutableStateOf(store.lockOnUnlock()) }
+    var grace by remember { mutableStateOf(store.graceSeconds()) }
+    val guardEnabled = remember(refreshTick) { isGuardEnabled(context) }
+    val overlayOk = remember(refreshTick) { Settings.canDrawOverlays(context) }
+    val guardOff = !guardEnabled && (protected.isNotEmpty() || lockOnUnlock)
+
+    // Se o usuário ficou mais de 1 minuto fora do VEIL, as telas sensíveis exigem nova autenticação.
+    LaunchedEffect(refreshTick) {
+        val away = SystemClock.elapsedRealtime() - stoppedAt
+        if (stoppedAt > 0L && away > 60_000L && store.configured() &&
+            (page == Page.SETTINGS || page == Page.SETUP || page == Page.CHANGE_AUTH)
+        ) {
+            page = Page.HOME
+        }
+    }
+
+    fun openApp(app: VeilAppInfo) {
+        if (app.packageName in protected) {
+            selected = app
+            purpose = AuthPurpose.OPEN_APP
+            authError = ""
+            page = Page.AUTH
+        } else {
+            context.packageManager.getLaunchIntentForPackage(app.packageName)?.let {
+                context.startActivity(it)
+            }
+        }
+    }
+
+    when (page) {
+        Page.SETUP -> CredentialScreen(
+            title = "Configure seu VEIL",
+            subtitle = "Escolha seus gestos, símbolos e crie seu PIN.",
+            onCancel = null,
+            onSave = { pin, gesture, symbols ->
+                store.setCredentials(pin, gesture, symbols)
+                page = Page.HOME
+            }
+        )
+        Page.CHANGE_AUTH -> AuthScreen(
+            title = "Confirme sua identidade",
+            subtitle = "Digite suas credenciais atuais para alterar a combinação.",
+            error = authError,
+            onCancel = { page = Page.SETTINGS; authError = "" },
+            onSubmit = { pin, gesture, symbols ->
+                if (store.verify(pin, gesture, symbols)) {
+                    page = Page.SETUP
+                    authError = ""
+                } else authError = "Combinação incorreta ou bloqueio temporário."
+            }
+        )
+        Page.AUTH -> AuthScreen(
+            title = if (purpose == AuthPurpose.OPEN_SETTINGS) "Configurações protegidas" else "Acesso protegido",
+            subtitle = if (purpose == AuthPurpose.OPEN_SETTINGS) {
+                "Confirme sua identidade para continuar."
+            } else {
+                selected?.label ?: "Aplicativo protegido"
+            },
+            error = authError,
+            onCancel = { page = Page.HOME; selected = null; authError = "" },
+            onSubmit = { pin, gesture, symbols ->
+                if (store.verify(pin, gesture, symbols)) {
+                    authError = ""
+                    if (purpose == AuthPurpose.OPEN_SETTINGS) {
+                        page = Page.SETTINGS
+                    } else {
+                        val app = selected
+                        page = Page.HOME
+                        selected = null
+                        if (app != null) {
+                            LockSession.markUnlocked(app.packageName)
+                            context.packageManager.getLaunchIntentForPackage(app.packageName)?.let { launch ->
+                                context.startActivity(launch)
+                            }
+                        }
+                    }
+                } else {
+                    val left = store.remainingLockMs()
+                    authError = if (left > 0) "Muitas tentativas. Aguarde ${((left + 999) / 1000)} segundos." else "Combinação incorreta."
+                }
+            }
+        )
+        Page.SETTINGS -> SettingsPage(
+            apps = apps,
+            protected = protected,
+            guardEnabled = guardEnabled,
+            overlayOk = overlayOk,
+            lockOnUnlock = lockOnUnlock,
+            graceSeconds = grace,
+            onToggle = { app, enabled ->
+                store.setProtected(app.packageName, enabled)
+                protected = store.protectedApps()
+            },
+            onLockOnUnlock = { value ->
+                store.setLockOnUnlock(value)
+                lockOnUnlock = value
+                if (!value) LockSession.deviceLocked = false
+            },
+            onGrace = { seconds ->
+                store.setGraceSeconds(seconds)
+                grace = seconds
+            },
+            onOpenAccessibility = {
+                context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+            },
+            onOpenOverlay = {
+                context.startActivity(
+                    Intent(
+                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:${context.packageName}")
+                    )
+                )
+            },
+            onChangeCredentials = { page = Page.CHANGE_AUTH },
+            onBack = { page = Page.HOME },
+            onReset = {
+                store.clearCredentials()
+                page = Page.SETUP
+            }
+        )
+        Page.HOME -> HomePage(
+            apps = apps,
+            protected = protected,
+            guardOff = guardOff,
+            onSettings = {
+                if (store.configured()) {
+                    purpose = AuthPurpose.OPEN_SETTINGS
+                    authError = ""
+                    page = Page.AUTH
+                } else {
+                    page = Page.SETTINGS
+                }
+            },
+            onOpen = ::openApp
+        )
+    }
+}
+
+@Suppress("DEPRECATION")
+private fun loadLaunchableApps(context: Context): List<VeilAppInfo> {
+    val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+    return context.packageManager.queryIntentActivities(intent, PackageManager.MATCH_ALL)
+        .mapNotNull { resolve ->
+            val info = resolve.activityInfo ?: return@mapNotNull null
+            if (info.packageName == context.packageName) return@mapNotNull null
+            VeilAppInfo(
+                resolve.loadLabel(context.packageManager).toString(),
+                info.packageName,
+                resolve.loadIcon(context.packageManager)
+            )
+        }
+        .distinctBy { it.packageName }
+        .sortedBy { it.label.lowercase() }
+}
+
+@Composable
+private fun VeilHeader(title: String, onBack: (() -> Unit)? = null) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        if (onBack != null) {
+            IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, null, tint = Silver) }
+        }
+        Text(title, color = White, fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+@Composable
+private fun HomePage(
+    apps: List<VeilAppInfo>,
+    protected: Set<String>,
+    guardOff: Boolean,
+    onSettings: () -> Unit,
+    onOpen: (VeilAppInfo) -> Unit
+) {
+    var query by remember { mutableStateOf("") }
+    val filtered = remember(query, apps) { apps.filter { it.label.contains(query, true) } }
+    val time = remember { java.time.format.DateTimeFormatter.ofPattern("HH:mm") }
+    var now by remember { mutableStateOf(java.time.LocalTime.now().format(time)) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            now = java.time.LocalTime.now().format(time)
+            kotlinx.coroutines.delay(15_000)
+        }
+    }
+    Column(
+        Modifier.fillMaxSize().background(Night).statusBarsPadding().navigationBarsPadding().padding(horizontal = 20.dp)
+    ) {
+        Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            Column {
+                Text("V E I L", color = White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                Text("SEU ESPAÇO, DO SEU JEITO", color = Muted, fontSize = 9.sp, letterSpacing = 2.sp)
+            }
+            IconButton(onClick = onSettings) { Icon(Icons.Default.Settings, "Configurações", tint = Silver) }
+        }
+        if (guardOff) {
+            Spacer(Modifier.height(10.dp))
+            Row(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Panel)
+                    .clickable(onClick = onSettings).padding(11.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(Icons.Default.Warning, null, tint = Danger, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(10.dp))
+                Text("Proteção em segundo plano desativada. Toque para configurar.", color = White, fontSize = 11.sp)
+            }
+        }
+        Spacer(Modifier.height(28.dp))
+        Text(now, color = White, fontSize = 58.sp, fontWeight = FontWeight.ExtraLight)
+        Text(java.time.LocalDate.now().format(java.time.format.DateTimeFormatter.ofPattern("EEEE, d 'de' MMMM", java.util.Locale("pt", "BR"))).replaceFirstChar { it.uppercase() }, color = Muted, fontSize = 13.sp)
+        Spacer(Modifier.height(30.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("APLICATIVOS", color = Silver, fontSize = 10.sp, letterSpacing = 3.sp, modifier = Modifier.weight(1f))
+            Text("${filtered.size}", color = Muted, fontSize = 11.sp)
+        }
+        Spacer(Modifier.height(12.dp))
+        OutlinedTextField(
+            value = query, onValueChange = { query = it },
+            modifier = Modifier.fillMaxWidth(),
+            placeholder = { Text("Buscar aplicativos", color = Muted) },
+            leadingIcon = { Icon(Icons.Default.Search, null, tint = Muted) },
+            trailingIcon = { if (query.isNotEmpty()) IconButton(onClick = { query = "" }) { Icon(Icons.Default.Close, null, tint = Muted) } },
+            singleLine = true, shape = RoundedCornerShape(18.dp),
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = Silver, unfocusedBorderColor = Panel2,
+                focusedTextColor = White, unfocusedTextColor = White,
+                cursorColor = Silver
+            )
+        )
+        Spacer(Modifier.height(12.dp))
+        if (filtered.isEmpty()) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text("Nenhum aplicativo encontrado.", color = Muted)
+            }
+        } else {
+            LazyColumn(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                contentPadding = PaddingValues(bottom = 18.dp)
+            ) {
+                items(filtered, key = { it.packageName }) { app ->
+                    Row(
+                        Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp))
+                            .background(Panel).clickable { onOpen(app) }
+                            .padding(horizontal = 13.dp, vertical = 11.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        val bitmap = remember(app.packageName) { app.icon.toBitmap(96, 96).asImageBitmap() }
+                        androidx.compose.foundation.Image(bitmap, contentDescription = app.label, modifier = Modifier.size(38.dp))
+                        Spacer(Modifier.width(13.dp))
+                        Text(app.label, color = White, modifier = Modifier.weight(1f), fontSize = 14.sp)
+                        if (app.packageName in protected) Icon(Icons.Default.Lock, "Protegido", tint = Silver, modifier = Modifier.size(17.dp))
+                        else Icon(Icons.Default.ChevronRight, null, tint = Muted)
+                    }
+                }
+            }
+        }
+        Text("VEIL LAUNCHER  •  TOQUE EM UM APP PARA ABRIR", color = Color(0xFF596579), fontSize = 8.sp, letterSpacing = 1.sp, modifier = Modifier.align(Alignment.CenterHorizontally).padding(vertical = 8.dp))
+    }
+}
+
+@Composable
+private fun SettingsPage(
+    apps: List<VeilAppInfo>,
+    protected: Set<String>,
+    guardEnabled: Boolean,
+    overlayOk: Boolean,
+    lockOnUnlock: Boolean,
+    graceSeconds: Int,
+    onToggle: (VeilAppInfo, Boolean) -> Unit,
+    onLockOnUnlock: (Boolean) -> Unit,
+    onGrace: (Int) -> Unit,
+    onOpenAccessibility: () -> Unit,
+    onOpenOverlay: () -> Unit,
+    onChangeCredentials: () -> Unit,
+    onBack: () -> Unit,
+    onReset: () -> Unit
+) {
+    var query by remember { mutableStateOf("") }
+    val filtered = apps.filter { it.label.contains(query, true) }
+    LazyColumn(
+        Modifier.fillMaxSize().background(Night).statusBarsPadding().navigationBarsPadding()
+            .padding(horizontal = 20.dp),
+        verticalArrangement = Arrangement.spacedBy(5.dp),
+        contentPadding = PaddingValues(vertical = 20.dp)
+    ) {
+        item { VeilHeader("Configurações", onBack) }
+
+        item { SectionLabel("PROTEÇÃO EM SEGUNDO PLANO") }
+        item {
+            StatusAction(
+                "Serviço de acessibilidade",
+                if (guardEnabled) "Ativo: detecta quando um app protegido é aberto" else "Desativado. Toque para ativar",
+                guardEnabled, onOpenAccessibility
+            )
+        }
+        item {
+            StatusAction(
+                "Exibir sobre outros apps",
+                if (overlayOk) "Permitido" else "Necessário para mostrar o bloqueio por cima dos apps",
+                overlayOk, onOpenOverlay
+            )
+        }
+        item {
+            Text(
+                "O VEIL usa o serviço de acessibilidade apenas para saber qual app foi aberto e exibir o bloqueio. " +
+                    "Ele não lê o conteúdo da tela nem envia dados para fora do aparelho. " +
+                    "Se o Android não deixar ativar, abra Informações do app > menu ⋮ > Permitir configurações restritas.",
+                color = Muted, fontSize = 11.sp
+            )
+        }
+        item {
+            SwitchRow(
+                "Bloquear ao desbloquear o celular",
+                "Exige o VEIL logo depois da tela de bloqueio do Android",
+                lockOnUnlock, onLockOnUnlock
+            )
+        }
+        item {
+            Column(Modifier.padding(top = 6.dp)) {
+                Text("Pedir senha de novo depois de sair de um app protegido:", color = Muted, fontSize = 11.sp)
+                Row(
+                    Modifier.fillMaxWidth().padding(top = 6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    listOf(0 to "Ao sair", 30 to "30 s", 60 to "1 min", 300 to "5 min").forEach { (seconds, label) ->
+                        val sel = graceSeconds == seconds
+                        Box(
+                            Modifier.weight(1f).height(38.dp).clip(RoundedCornerShape(10.dp))
+                                .background(if (sel) Panel2 else Panel)
+                                .clickable { onGrace(seconds) },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(label, color = if (sel) Silver else White, fontSize = 12.sp)
+                        }
+                    }
+                }
+            }
+        }
+
+        item { SectionLabel("SEGURANÇA") }
+        item { SettingsAction("Alterar credenciais", "Atualize gestos, símbolos e PIN", Icons.Default.Key, onChangeCredentials) }
+        item { SettingsAction("Redefinir credenciais", "Apaga a combinação atual e solicita uma nova", Icons.Default.Refresh, onReset) }
+
+        item { SectionLabel("APLICATIVOS PROTEGIDOS") }
+        item {
+            OutlinedTextField(
+                value = query, onValueChange = { query = it }, modifier = Modifier.fillMaxWidth(),
+                placeholder = { Text("Filtrar aplicativos", color = Muted) },
+                leadingIcon = { Icon(Icons.Default.Search, null, tint = Muted) },
+                singleLine = true, shape = RoundedCornerShape(16.dp),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = Silver, unfocusedBorderColor = Panel2,
+                    focusedTextColor = White, unfocusedTextColor = White
+                )
+            )
+        }
+        items(filtered, key = { it.packageName }) { app ->
+            Row(
+                Modifier.fillMaxWidth().background(Panel, RoundedCornerShape(13.dp))
+                    .padding(start = 10.dp, end = 8.dp, top = 5.dp, bottom = 5.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(app.label, color = White, modifier = Modifier.weight(1f), fontSize = 13.sp)
+                Switch(
+                    checked = app.packageName in protected,
+                    onCheckedChange = { onToggle(app, it) },
+                    colors = SwitchDefaults.colors(checkedThumbColor = Night, checkedTrackColor = Silver)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SectionLabel(text: String) {
+    Text(
+        text, color = Silver, fontSize = 10.sp, letterSpacing = 2.sp,
+        modifier = Modifier.padding(top = 14.dp, bottom = 2.dp)
+    )
+}
+
+@Composable
+private fun StatusAction(title: String, subtitle: String, ok: Boolean, onClick: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp))
+            .background(Panel).clickable(onClick = onClick).padding(13.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            if (ok) Icons.Default.CheckCircle else Icons.Default.Warning, null,
+            tint = if (ok) Silver else Danger
+        )
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text(title, color = White, fontSize = 14.sp)
+            Text(subtitle, color = if (ok) Muted else Danger, fontSize = 10.sp)
+        }
+        Icon(Icons.Default.ChevronRight, null, tint = Muted)
+    }
+}
+
+@Composable
+private fun SwitchRow(title: String, subtitle: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Panel)
+            .padding(start = 13.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(title, color = White, fontSize = 14.sp)
+            Text(subtitle, color = Muted, fontSize = 10.sp)
+        }
+        Switch(
+            checked = checked, onCheckedChange = onChange,
+            colors = SwitchDefaults.colors(checkedThumbColor = Night, checkedTrackColor = Silver)
+        )
+    }
+}
+
+@Composable
+private fun SettingsAction(title: String, subtitle: String, icon: androidx.compose.ui.graphics.vector.ImageVector, onClick: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().padding(vertical = 5.dp).clip(RoundedCornerShape(14.dp))
+            .background(Panel).clickable(onClick = onClick).padding(13.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(icon, null, tint = Silver)
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text(title, color = White, fontSize = 14.sp)
+            Text(subtitle, color = Muted, fontSize = 10.sp)
+        }
+        Icon(Icons.Default.ChevronRight, null, tint = Muted)
+    }
+}
+
+@Composable
+private fun CredentialScreen(
+    title: String,
+    subtitle: String,
+    onCancel: (() -> Unit)?,
+    onSave: (String, String, String) -> Unit
+) {
+    var pin by remember { mutableStateOf("") }
+    var confirm by remember { mutableStateOf("") }
+    var gesture by remember { mutableStateOf("") }
+    var gestureCount by remember { mutableStateOf(1) }
+    var symbols by remember { mutableStateOf(listOf<Int>()) }
+    var error by remember { mutableStateOf("") }
+
+    Column(
+        Modifier.fillMaxSize().background(Night).statusBarsPadding().navigationBarsPadding()
+            .imePadding().verticalScroll(rememberScrollState())
+            .padding(horizontal = 24.dp, vertical = 18.dp),
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text("V E I L", color = Silver, fontSize = 13.sp, letterSpacing = 5.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(15.dp))
+        Text(title, color = White, fontSize = 27.sp, fontWeight = FontWeight.Light)
+        Text(subtitle, color = Muted, fontSize = 13.sp)
+        Spacer(Modifier.height(20.dp))
+        Text("1 · ESCOLHA E DESENHE SEUS GESTOS", color = Silver, fontSize = 10.sp, letterSpacing = 2.sp)
+        CountStepper("Quantidade de gestos (1 a 6)", gestureCount, 1, 6) { n ->
+            gestureCount = n
+            if (strokesOf(gesture).size > n) gesture = strokesOf(gesture).take(n).joinToString(",")
+        }
+        GesturePad(gesture, maxStrokes = gestureCount, showLimit = true, onGesture = { gesture = it })
+        Text("2 · ESCOLHA 3 A 6 SÍMBOLOS", color = Silver, fontSize = 10.sp, letterSpacing = 2.sp)
+        SymbolGrid(symbols) { value ->
+            symbols = if (value in symbols) symbols - value else if (symbols.size < 6) symbols + value else symbols
+        }
+        Spacer(Modifier.height(12.dp))
+        Text("3 · CRIE UM PIN DE 6 A 12 DÍGITOS", color = Silver, fontSize = 10.sp, letterSpacing = 2.sp)
+        PinField("PIN", pin) { pin = it }
+        PinField("Confirmar PIN", confirm) { confirm = it }
+        if (error.isNotBlank()) Text(error, color = Danger, fontSize = 12.sp)
+        Spacer(Modifier.height(10.dp))
+        Button(
+            onClick = {
+                error = when {
+                    strokesOf(gesture).size != gestureCount -> "Desenhe exatamente $gestureCount gesto(s). Você fez ${strokesOf(gesture).size}."
+                    symbols.size < 3 -> "Escolha pelo menos 3 símbolos."
+                    pin.length < 6 -> "O PIN precisa ter pelo menos 6 dígitos."
+                    pin != confirm -> "Os PINs não coincidem."
+                    else -> ""
+                }
+                if (error.isEmpty()) onSave(pin, gesture, symbols.joinToString(","))
+            },
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(containerColor = Silver, contentColor = Night)
+        ) { Text("Salvar combinação", fontWeight = FontWeight.SemiBold) }
+        if (onCancel != null) TextButton(onClick = onCancel, modifier = Modifier.align(Alignment.CenterHorizontally)) {
+            Text("Cancelar", color = Muted)
+        }
+    }
+}
+
+@Composable
+internal fun AuthScreen(
+    title: String,
+    subtitle: String,
+    error: String,
+    onCancel: () -> Unit,
+    onSubmit: (String, String, String) -> Unit
+) {
+    var pin by remember { mutableStateOf("") }
+    var gesture by remember { mutableStateOf("") }
+    var symbols by remember { mutableStateOf(listOf<Int>()) }
+    Column(
+        Modifier.fillMaxSize().background(Night).statusBarsPadding().navigationBarsPadding()
+            .imePadding().verticalScroll(rememberScrollState())
+            .padding(24.dp),
+        verticalArrangement = Arrangement.Center
+    ) {
+        Icon(Icons.Default.Lock, null, tint = Silver, modifier = Modifier.size(34.dp))
+        Spacer(Modifier.height(15.dp))
+        Text(title, color = White, fontSize = 27.sp, fontWeight = FontWeight.Light)
+        Text(subtitle, color = Muted, fontSize = 13.sp)
+        Spacer(Modifier.height(24.dp))
+        Text("DESENHE SEUS GESTOS NA ORDEM", color = Silver, fontSize = 10.sp, letterSpacing = 2.sp)
+        GesturePad(gesture, maxStrokes = 6, showLimit = false, onGesture = { gesture = it })
+        Text("SELECIONE OS SÍMBOLOS NA ORDEM", color = Silver, fontSize = 10.sp, letterSpacing = 2.sp)
+        SymbolGrid(symbols) { value ->
+            symbols = if (value in symbols) symbols - value else if (symbols.size < 6) symbols + value else symbols
+        }
+        Spacer(Modifier.height(12.dp))
+        PinField("PIN", pin) { pin = it }
+        if (error.isNotBlank()) Text(error, color = Danger, fontSize = 12.sp)
+        Spacer(Modifier.height(12.dp))
+        Button(
+            onClick = { onSubmit(pin, gesture, symbols.joinToString(",")) },
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(containerColor = Silver, contentColor = Night)
+        ) { Text("Desbloquear") }
+        TextButton(onClick = onCancel, modifier = Modifier.align(Alignment.CenterHorizontally)) {
+            Text("Cancelar", color = Muted)
+        }
+    }
+}
+
+private val DirNames = listOf("R", "UR", "U", "UL", "L", "DL", "D", "DR")
+private val ArrowOf = mapOf(
+    "R" to "→", "UR" to "↗", "U" to "↑", "UL" to "↖",
+    "L" to "←", "DL" to "↙", "D" to "↓", "DR" to "↘"
+)
+
+private fun strokesOf(value: String): List<String> =
+    if (value.isBlank()) emptyList() else value.split(",")
+
+private fun directionOf(start: Offset, end: Offset, minLength: Float): String? {
+    val dx = end.x - start.x
+    val dy = end.y - start.y
+    if (hypot(dx, dy) < minLength) return null
+    val degrees = Math.toDegrees(atan2((-dy).toDouble(), dx.toDouble()))
+    val index = Math.floorMod(Math.round(degrees / 45.0).toInt(), 8)
+    return DirNames[index]
+}
+
+@Composable
+private fun CountStepper(label: String, value: Int, min: Int, max: Int, onChange: (Int) -> Unit) {
+    Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(label, color = Muted, fontSize = 12.sp, modifier = Modifier.weight(1f))
+        IconButton(onClick = { if (value > min) onChange(value - 1) }) {
+            Icon(Icons.Default.Remove, "Menos", tint = Silver)
+        }
+        Text("$value", color = White, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+        IconButton(onClick = { if (value < max) onChange(value + 1) }) {
+            Icon(Icons.Default.Add, "Mais", tint = Silver)
+        }
+    }
+}
+
+@Composable
+private fun GesturePad(
+    value: String,
+    maxStrokes: Int,
+    showLimit: Boolean,
+    onGesture: (String) -> Unit
+) {
+    var points by remember { mutableStateOf(listOf<Offset>()) }
+    val currentValue by rememberUpdatedState(value)
+    val currentMax by rememberUpdatedState(maxStrokes)
+    val currentCallback by rememberUpdatedState(onGesture)
+    val strokes = strokesOf(value)
+    val full = strokes.size >= maxStrokes
+
+    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
+        Box(
+            Modifier.fillMaxWidth().height(112.dp).padding(vertical = 7.dp)
+                .clip(RoundedCornerShape(16.dp)).background(Panel)
+                .pointerInput(Unit) {
+                    detectDragGestures(
+                        onDragStart = { start -> points = listOf(start) },
+                        onDrag = { change, _ ->
+                            points = points + change.position
+                            change.consume()
+                        },
+                        onDragEnd = {
+                            val sampled = points
+                            val existing = strokesOf(currentValue)
+                            if (sampled.size > 1 && existing.size < currentMax) {
+                                val dir = directionOf(sampled.first(), sampled.last(), 40f)
+                                if (dir != null) {
+                                    currentCallback((existing + dir).joinToString(","))
+                                }
+                            }
+                            points = emptyList()
+                        },
+                        onDragCancel = { points = emptyList() }
+                    )
+                },
+            contentAlignment = Alignment.Center
+        ) {
+            Canvas(Modifier.fillMaxSize()) {
+                if (points.size > 1) {
+                    val path = Path().apply {
+                        moveTo(points.first().x, points.first().y)
+                        points.drop(1).forEach { lineTo(it.x, it.y) }
+                    }
+                    drawPath(path, Silver, style = androidx.compose.ui.graphics.drawscope.Stroke(width = 5.dp.toPx(), cap = StrokeCap.Round))
+                }
+                if (points.isEmpty()) {
+                    drawCircle(Silver.copy(alpha = 0.22f), radius = 4.dp.toPx(), center = Offset(size.width / 2, size.height / 2))
+                }
+            }
+            if (points.isEmpty()) {
+                Text(
+                    if (full && showLimit) "Todos os gestos registrados" else "Deslize o dedo aqui",
+                    color = Muted, fontSize = 12.sp
+                )
+            }
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                if (strokes.isEmpty()) "Gestos: —"
+                else "Gestos: " + strokes.joinToString("  ") { ArrowOf[it] ?: it },
+                color = Silver, fontSize = 12.sp, modifier = Modifier.weight(1f)
+            )
+            if (showLimit) {
+                Text("${strokes.size}/$maxStrokes", color = Muted, fontSize = 11.sp)
+            }
+            TextButton(
+                enabled = strokes.isNotEmpty(),
+                onClick = { onGesture(strokes.dropLast(1).joinToString(",")) }
+            ) { Text("Desfazer", color = Muted, fontSize = 11.sp) }
+            TextButton(
+                enabled = strokes.isNotEmpty(),
+                onClick = { onGesture("") }
+            ) { Text("Limpar", color = Muted, fontSize = 11.sp) }
+        }
+    }
+}
+
+@Composable
+private fun SymbolGrid(selected: List<Int>, onSelect: (Int) -> Unit) {
+    val symbols = listOf("○", "◇", "△", "□", "✦", "⬡", "⌁", "☆", "◈")
+    Column(verticalArrangement = Arrangement.spacedBy(5.dp), modifier = Modifier.fillMaxWidth()) {
+        for (row in 0..2) {
+            Row(horizontalArrangement = Arrangement.spacedBy(7.dp), modifier = Modifier.fillMaxWidth()) {
+                for (col in 0..2) {
+                    val index = row * 3 + col + 1
+                    val active = index in selected
+                    Box(
+                        Modifier.weight(1f).height(38.dp).clip(RoundedCornerShape(10.dp))
+                            .background(if (active) Panel2 else Panel)
+                            .clickable { onSelect(index) },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(symbols[index - 1], color = if (active) Silver else White, fontSize = 19.sp)
+                    }
+                }
+            }
+        }
+    }
+    if (selected.isNotEmpty()) {
+        Text("Ordem: ${selected.joinToString(" → ")}", color = Muted, fontSize = 10.sp, modifier = Modifier.padding(top = 4.dp))
+    }
+}
+
+@Composable
+private fun PinField(label: String, value: String, onValue: (String) -> Unit) {
+    OutlinedTextField(
+        value = value,
+        onValueChange = { onValue(it.filter(Char::isDigit).take(12)) },
+        label = { Text(label) },
+        modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+        singleLine = true,
+        visualTransformation = PasswordVisualTransformation(),
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+        shape = RoundedCornerShape(13.dp),
+        colors = OutlinedTextFieldDefaults.colors(
+            focusedBorderColor = Silver, unfocusedBorderColor = Panel2,
+            focusedTextColor = White, unfocusedTextColor = White,
+            focusedLabelColor = Silver, unfocusedLabelColor = Muted,
+            cursorColor = Silver
+        )
+    )
+}

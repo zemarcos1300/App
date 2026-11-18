@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">VEIL Launcher</string>
+    <string name="guard_label">VEIL Proteção de apps</string>
+    <string name="guard_description">Usado somente para detectar qual aplicativo foi aberto e exibir o bloqueio do VEIL (PIN, gesto e símbolos). O VEIL não lê o conteúdo da tela, não grava o que você digita e não envia dados para fora do aparelho.</string>
+</resources>
